@@ -46,7 +46,7 @@ def get_opts():
     parser.add_argument('--ckpt_path', type=str, required=True,
                         help='pretrained checkpoint path to load')
 
-    parser.add_argument('--save_depth', default=False, action="store_true",
+    parser.add_argument('--save_depth', default=True, action="store_true",
                         help='whether to save depth prediction')
     parser.add_argument('--depth_format', type=str, default='pfm',
                         choices=['pfm', 'bytes'],

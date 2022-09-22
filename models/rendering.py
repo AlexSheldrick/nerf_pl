@@ -1,5 +1,5 @@
 import torch
-from torchsearchsorted import searchsorted
+#from torchsearchsorted import searchsorted
 
 __all__ = ['render_rays']
 
@@ -39,7 +39,7 @@ def sample_pdf(bins, weights, N_importance, det=False, eps=1e-5):
         u = torch.rand(N_rays, N_importance, device=bins.device)
     u = u.contiguous()
 
-    inds = searchsorted(cdf, u, side='right')
+    inds = torch.searchsorted(cdf, u, side='right')
     below = torch.clamp_min(inds-1, 0)
     above = torch.clamp_max(inds, N_samples_)
 
@@ -88,7 +88,7 @@ def render_rays(models,
         result: dictionary containing final rgb and depth maps for coarse and fine models
     """
 
-    def inference(model, embedding_xyz, xyz_, dir_, dir_embedded, z_vals, weights_only=False):
+    def inference(model, embedding_xyz, xyz_, dir_, dir_embedded, z_vals, weights_only=False, compute_normals = False):
         """
         Helper function that performs model inference.
 
@@ -112,6 +112,9 @@ def render_rays(models,
                 depth_final: (N_rays) depth map
                 weights: (N_rays, N_samples_): weights of each sample
         """
+        if model.training and compute_normals:
+            xyz_.requires_grad_()
+
         N_samples_ = xyz_.shape[1]
         # Embed directions
         xyz_ = xyz_.view(-1, 3) # (N_rays*N_samples_, 3)
@@ -164,12 +167,19 @@ def render_rays(models,
 
         # compute final weighted outputs
         rgb_final = torch.sum(weights.unsqueeze(-1)*rgbs, -2) # (N_rays, 3)
+        
         depth_final = torch.sum(weights*z_vals, -1) # (N_rays)
+        depth_stdev = torch.sum(weights*(z_vals - depth_final[..., None])**2, -1)
+
 
         if white_back:
             rgb_final = rgb_final + 1-weights_sum.unsqueeze(-1)
 
-        return rgb_final, depth_final, weights
+        if model.training and compute_normals:
+            normals = torch.autograd.grad(sigmas, xyz_, grad_outputs=torch.ones_like(sigmas), retain_graph=True)[0].view(-1,N_samples_, 3)
+        else: normals = torch.zeros((sigmas.shape[0], N_samples_,3), device=z_vals.device)
+        
+        return rgb_final, depth_final, weights, normals, sigmas, depth_stdev
 
 
     # Extract models from lists
@@ -181,19 +191,21 @@ def render_rays(models,
     N_rays = rays.shape[0]
     rays_o, rays_d = rays[:, 0:3], rays[:, 3:6] # both (N_rays, 3)
     near, far = rays[:, 6:7], rays[:, 7:8] # both (N_rays, 1)
+    depth = rays[:,8:9]
 
-    # Embed direction
+    # Embed directiona
     dir_embedded = embedding_dir(rays_d) # (N_rays, embed_dir_channels)
 
     # Sample depth points
     z_steps = torch.linspace(0, 1, N_samples, device=rays.device) # (N_samples)
     if not use_disp: # use linear sampling in depth space
+        
         z_vals = near * (1-z_steps) + far * z_steps
     else: # use linear sampling in disparity space
         z_vals = 1/(1/near * (1-z_steps) + 1/far * z_steps)
 
     z_vals = z_vals.expand(N_rays, N_samples)
-    
+
     if perturb > 0: # perturb sampling depths (z_vals)
         z_vals_mid = 0.5 * (z_vals[: ,:-1] + z_vals[: ,1:]) # (N_rays, N_samples-1) interval mid points
         # get intervals between samples
@@ -212,12 +224,16 @@ def render_rays(models,
                       dir_embedded, z_vals, weights_only=True)
         result = {'opacity_coarse': weights_coarse.sum(1)}
     else:
-        rgb_coarse, depth_coarse, weights_coarse = \
+        rgb_coarse, depth_coarse, weights_coarse, normals_coarse, sigmas_coarse, depth_stdev_coarse = \
             inference(model_coarse, embedding_xyz, xyz_coarse_sampled, rays_d,
                       dir_embedded, z_vals, weights_only=False)
+
         result = {'rgb_coarse': rgb_coarse,
                   'depth_coarse': depth_coarse,
-                  'opacity_coarse': weights_coarse.sum(1)
+                  'opacity_coarse': weights_coarse.sum(1),
+                  'normals_coarse':normals_coarse,
+                  'weights_coarse':weights_coarse,
+                  #'depth_stdev_coarse': depth_stdev_coarse
                  }
 
     if N_importance > 0: # sample points for fine model
@@ -233,12 +249,62 @@ def render_rays(models,
                            # (N_rays, N_samples+N_importance, 3)
 
         model_fine = models[1]
-        rgb_fine, depth_fine, weights_fine = \
+        rgb_fine, depth_fine, weights_fine, normals_fine, sigmas_fine, depth_stdev_fine = \
             inference(model_fine, embedding_xyz, xyz_fine_sampled, rays_d,
-                      dir_embedded, z_vals, weights_only=False)
-
+                      dir_embedded, z_vals, weights_only=False, compute_normals = False)
+        
+        if models[0].training:
+            distortion = lossfun_distortion(z_vals, weights_fine)
+        else: distortion = torch.zeros(depth.shape, device=depth.device)
+        #distortion = torch.zeros(depth.shape, device=depth.device)
+        
         result['rgb_fine'] = rgb_fine
         result['depth_fine'] = depth_fine
-        result['opacity_fine'] = weights_fine.sum(1)
+        result['opacity_fine'] = weights_fine.sum(1)       
+
+        result['normals_fine'] = normals_fine
+        result['weights_fine'] = weights_fine
+        result['depth_stdev_fine'] = depth_stdev_fine
+        result['distortion'] = distortion
+        #result['newdepth'] = loss_fun_depth(z_vals, weights_fine, depth)
 
     return result
+
+def loss_fun_depth(t, w, d):
+    loss = (w*(t - d[...,None])**2)
+    #loss[d.flatten() < 1] = 0
+    #loss = torch.mean(loss)
+    return loss
+
+
+def loss_fun_depth_2(t, w, d, s):
+    err = 1
+    loss = -torch.log(w) * torch.exp(-(t - d[:,None]) ** 2 / (2 * err)) * s
+    loss[d.flatten() < 1] = 0
+    #loss = torch.mean(loss)
+    return loss
+
+def lossfun_distortion(t, w):   #t=z_vals, w=weights. Loss from mip-nerf 360
+        """Compute iint w[i] w[j] |t[i] - t[j]| di dj."""
+        # The loss incurred between all pairs of intervals.
+        ut = (t[..., 1:] + t[..., :-1]) / 2
+        dut = torch.abs(ut[..., :, None] - ut[..., None, :])
+        loss_inter = torch.sum(w[...,:-1] * torch.sum(w[..., None, :-1] * dut, axis=-1), axis=-1)
+
+        # The loss incurred within each individual interval with itself.
+        loss_intra = torch.sum(w[...,:-1]**2 * (t[..., 1:] - t[..., :-1]), axis=-1) / 3
+        loss = loss_inter + loss_intra
+
+        return loss
+
+def argmax_loss(t, w, d, eps = 2e-1, k=4):
+    t = t[d > 0, ...]
+    w = w[d > 0, ...]
+    d = d[d > 0]
+    #alpha = torch.sum(w, -1, keepdim=True)
+    wmax, wmaxidx = torch.topk(w, k, -1)
+    tmax = torch.gather(t, 1, wmaxidx)
+    loss = torch.abs(tmax - d[..., None]) - eps    
+    loss = torch.maximum(loss, torch.zeros_like(loss))
+    loss = torch.sum(loss, dim=-1)
+    return loss

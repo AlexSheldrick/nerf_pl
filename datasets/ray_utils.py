@@ -19,8 +19,8 @@ def get_ray_directions(H, W, focal):
     # the direction here is without +0.5 pixel centering as calibration is not so accurate
     # see https://github.com/bmild/nerf/issues/24
     directions = \
-        torch.stack([(i-W/2)/focal, -(j-H/2)/focal, -torch.ones_like(i)], -1) # (H, W, 3)
-
+        torch.stack([(i+0.5-W/2)/focal, -(j+0.5-H/2)/focal, -torch.ones_like(i)], -1) # (H, W, 3)
+        
     return directions
 
 
@@ -40,7 +40,10 @@ def get_rays(directions, c2w):
     """
     # Rotate ray directions from camera coordinate to the world coordinate
     rays_d = directions @ c2w[:, :3].T # (H, W, 3)
-    rays_d = rays_d / torch.norm(rays_d, dim=-1, keepdim=True)
+
+    #rays_d = rays_d / torch.norm(rays_d, dim=-1, keepdim=True) # do not normalize ray directions
+
+
     # The origin of all rays is the camera origin in world coordinate
     rays_o = c2w[:, 3].expand(rays_d.shape) # (H, W, 3)
 
